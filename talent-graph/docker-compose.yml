@@ -18,12 +18,14 @@ services:
 
   backend:
     build: ./backend
+    image: talent-graph-backend:latest        # 显式命名，便于 docker save/load 与推私有仓库
     container_name: talent-graph-backend
-    env_file: ./backend/.env
+    # 配置已烘焙进镜像（backend/.env → /app/.env），故不再挂 env_file；
+    # 此处只覆盖「容器间通信」这一项：镜像内 .env 写的是 localhost，容器里必须走 db 服务名
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/talent_graph
     ports:
-      - "8000:8000"
+      - "20021:8000"        # 宿主机 20021 → 容器内 8000
     volumes:
       - upload_data:/app/data/uploads
     depends_on:
@@ -39,9 +41,10 @@ services:
 
   frontend:
     build: ./frontend
+    image: talent-graph-frontend:latest
     container_name: talent-graph-frontend
     ports:
-      - "8080:80"
+      - "20022:80"          # 宿主机 20022 → 容器内 80
     depends_on:
       - backend
 

@@ -3,7 +3,7 @@ __pycache__
 .venv
 venv
 data
-.env
+# 注意：.env 不再忽略——它要被烘焙进镜像（见 Dockerfile 的 COPY .env）
 .git
 .gitignore
 *.log

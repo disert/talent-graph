@@ -10,5 +10,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
+# 配置烘焙进镜像：pydantic-settings 会在 WORKDIR(/app) 下自动读取 .env，
+# 所以内网部署时无需再提供 backend/.env 文件。
+# 代价：改了 .env 里的地址/密钥必须重新 build 镜像才会生效。
+COPY .env ./.env
+
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

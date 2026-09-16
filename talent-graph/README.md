@@ -58,8 +58,12 @@ cp backend/.env.example backend/.env   # 填写内部大模型平台地址
 docker compose up -d --build
 ```
 
-- 前端：http://localhost:8080
-- API 文档：http://localhost:8000/docs
+- 前端：http://localhost:20022
+- API 文档：http://localhost:20021/docs
+
+> `backend/.env` 在 build 阶段被 `COPY` 进镜像的 `/app/.env`（配置烘焙进镜像），容器启动时由
+> pydantic-settings 读取。好处是内网部署只需带镜像（见「内网离线部署」）；
+> 代价是**改了它必须重新 `--build`** 才生效。
 
 ### 方式二：本地开发
 
@@ -71,15 +75,43 @@ docker compose up -d db
 cd backend
 pip install -r requirements.txt
 cp .env.example .env    # DATABASE_URL db 改为 localhost
-uvicorn app.main:app --reload --port 8000
+uvicorn app.main:app --reload --port 20021
 # 如果unicorn指令无法识别 可以使用下列指令
-python -m uvicorn app.main:app --reload --port 8000
+python -m uvicorn app.main:app --reload --port 20021
 
 # 前端
 cd frontend
 npm install
-npm run dev             # http://localhost:5173，已配置 /api 代理
+npm run dev             # http://localhost:20022，已配置 /api 代理
 ```
+
+## 内网离线部署
+
+配置已随 `backend/.env` 烘焙进镜像（`/app/.env`），内网机器**不需要再提供 `.env`**，
+只需要镜像 + 一份 `docker-compose.yml`。
+
+> 交给运维的完整交付流程（环境要求、验收命令、备份恢复、常见报错排查）见 **`部署说明.md`**，
+> 连同 `talent-graph-images.tar` 与 `docker-compose.yml` 一起发出即可。
+
+```bash
+# 1) 有网机器导出（已 build 过就直接 save；基础镜像 python/node/nginx 不用带，层已包含在产物里）
+docker save -o talent-graph-images.tar pgvector/pgvector:pg16 talent-graph-backend:latest talent-graph-frontend:latest
+
+# 2) 拷进内网后导入
+docker load -i talent-graph-images.tar
+
+# 3) 把 docker-compose.yml 一起带过去，然后执行（不要加 --build：内网拉不到基础镜像）
+docker compose up -d
+```
+
+- **内网要改配置**：改 `backend/.env` → `docker compose build backend && docker compose up -d --force-recreate backend`。
+  配置在镜像里，**必须重建**才生效（重启容器没用）。
+- **`DATABASE_URL` 是例外**：它由 `docker-compose.yml` 的 `environment` 在运行时注入并覆盖镜像内的值
+  （镜像里写的是 `localhost`，容器里必须走 `db` 服务名），改它只要 `docker compose up -d --force-recreate backend`。
+- **数据**（可选）：命名卷 `talent-graph_pgdata`（库）+ `talent-graph_upload_data`（简历原件）。
+  要带历史数据需一并迁移；只迁库不迁原件，导出 ZIP 会标「（原件缺失）」。
+- **安全**：镜像内含明文密钥，不要推到不可信的仓库或外发。
+- **OCR 不可用**：镜像内未安装 PaddleOCR（Dockerfile 里那行是注释状态），扫描件/图片简历会停在解析失败。
 
 ## 使用流程（对应演示主线）
 
@@ -151,7 +183,7 @@ python tests/mock_llm_server.py          # 监听 :9000
 # 终端2：以 SQLite 演示模式启动后端（无需 PostgreSQL）
 # Git Bash:  set -a && . ./.env.test && set +a
 # PowerShell: 手动设置 .env.test 中的同名环境变量
-uvicorn app.main:app --port 8000
+uvicorn app.main:app --port 20021
 
 # 终端3：全链路冒烟测试
 python tests/smoke_test.py

@@ -134,6 +134,14 @@ function buildJobCascader(tree: DepartmentNode[], jobs: Job[]): JobCascaderData 
     valuesOfJob.set(job.id, values);
   }
 
+  // 部门节点标签补上「岗位数量（含下级部门）」，方便在展开前就看清该层级的岗位规模
+  for (const [key, node] of index) {
+    node.label = `${node.label}（${jobsUnder.get(key)?.length ?? 0}）`;
+  }
+  if (unassigned) {
+    unassigned.label = `${unassigned.label}（${jobsUnder.get(UNASSIGNED_KEY)?.length ?? 0}）`;
+  }
+
   sortOptions(options);
   return { options, jobsUnder, valuesOfJob };
 }
@@ -279,7 +287,7 @@ export default function MatchResultPage() {
     <Card title="匹配结果（简历上传 / 岗位新建时已自动匹配落库，本页仅查询结果表）">
       <Space style={{ marginBottom: 12 }} wrap>
         <Cascader
-          style={{ width: 460 }}
+          style={{ width: 520 }}
           options={cascader.options}
           value={cascadeValue}
           onChange={pickFromCascade}
@@ -287,7 +295,7 @@ export default function MatchResultPage() {
           expandTrigger="hover"
           showSearch={{ limit: 200 }}
           allowClear
-          placeholder="按需求部门层级选择岗位（可搜索部门 / 岗位名称）"
+          placeholder="按需求部门层级选择岗位（括号内为该层级岗位数量，可搜索）"
         />
         <Button type="primary" onClick={run} loading={running}>
           重新匹配
