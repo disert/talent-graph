@@ -9,9 +9,10 @@ import type { ChangeEvent, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   departmentApi, jobApi,
-  type DepartmentImportResult, type DepartmentNode, type Job, type JobImportSession,
+  type DepartmentImportResult, type DepartmentNode, type Job,
 } from "../api/client";
 import PieChart from "../components/PieChart";
+import { useJobImport } from "../stores/jobImport";
 
 const EXAMPLE = `例：我们需要一位电力系统自动化方向的博士，35 岁以下，研究方向偏新能源并网或储能调度，
 熟悉 PSCAD/MATLAB 仿真，有电网调度或设计院经验优先，能到深圳全职工作。`;
@@ -297,36 +298,15 @@ interface FormValues {
   raw_text: string;
 }
 
-/** 批量导入的异常明细 */
-interface ImportError {
-  row: number;
-  title: string;
-  message: string;
-}
-
-/** 批量导入的进度状态（逐行调用后端，用于进度条） */
-interface ImportTask {
-  total: number;
-  done: number;
-  succeeded: number;
-  failed: number;
-  current: string;
-  errors: ImportError[];
-  /** 预校验发现的异常行数（缺岗位名称 / 需求描述） */
-  preInvalid: number;
-  running: boolean;
-  finished: boolean;
-}
-
 export default function JobRequestPage() {
   const [form] = Form.useForm<FormValues>();
   const [jobs, setJobs] = useState<Job[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [deptTree, setDeptTree] = useState<DepartmentNode[]>([]);
   const [importing, setImporting] = useState(false);
-  const [importTask, setImportTask] = useState<ImportTask | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
-  const cancelImportRef = useRef(false);
+  // 批量导入进度放在全局 store：切走/切回页面不丢进度，仍可查看与中止
+  const importTask = useJobImport((s) => s.task);
 
   // 需求部门 -> 省份：省份维护在组织架构上，表单不再单独选择
   const selectedDept = Form.useWatch("department", form) as string[] | undefined;
@@ -372,48 +352,25 @@ export default function JobRequestPage() {
     }
   };
 
-  // ---- Excel 批量导入：先解析建会话，再逐行入库（进度条 + 异常明细） ----
+  // ---- Excel 批量导入：先解析建会话，store 内逐行入库（进度条 + 异常明细，跨页面保持） ----
   const triggerImport = () => fileRef.current?.click();
 
-  const appendImportError = (err: ImportError) =>
-    setImportTask((t) => (t ? { ...t, errors: [...t.errors, err] } : t));
-
-  const runImport = async (session: JobImportSession) => {
-    let done = 0;
-    let succeeded = 0;
-    let failed = 0;
-    for (let i = 0; i < session.items.length; i += 1) {
-      if (cancelImportRef.current) break;
-      const item = session.items[i];
-      const label = item.title || `第 ${item.row} 行`;
-      setImportTask((t) => (t ? { ...t, current: label } : t));
-      try {
-        const r = await jobApi.importStep(session.token, i);
-        if (r.data.ok) {
-          succeeded += 1;
-        } else {
-          failed += 1;
-          appendImportError({ row: r.data.row, title: r.data.title || label,
-                              message: r.data.error || "导入失败" });
-        }
-      } catch (err: any) {
-        failed += 1;
-        appendImportError({ row: item.row, title: label,
-                            message: err?.response?.data?.detail || "请求失败" });
+  // 导入在后台 store 循环执行，这里监听其"运行中 -> 结束/中止"的转换：
+  // 结束后续刷岗位列表并给出汇总提示；切回本页时已有挂载时的初始化刷新兜底。
+  const prevImportRunning = useRef<boolean | undefined>(undefined);
+  useEffect(() => {
+    const t = importTask;
+    if (!t) return;
+    if (prevImportRunning.current === true && !t.running) {
+      if (t.failed === 0) {
+        message.success(`批量导入完成：${t.succeeded} 条全部成功`);
+      } else {
+        message.warning(`导入完成：成功 ${t.succeeded} 条，失败 ${t.failed} 条，详见异常明细`);
       }
-      done += 1;
-      setImportTask((t) => (t ? { ...t, done, succeeded, failed } : t));
+      refresh();
     }
-    setImportTask((t) => (t ? { ...t, done, succeeded, failed, current: "",
-                                running: false, finished: true } : t));
-    cancelImportRef.current = false;
-    refresh();
-    if (failed === 0) {
-      message.success(`批量导入完成：${succeeded} 条全部成功`);
-    } else {
-      message.warning(`导入完成：成功 ${succeeded} 条，失败 ${failed} 条，详见异常明细`);
-    }
-  };
+    prevImportRunning.current = t.running;
+  }, [importTask]);
 
   const onPickImportFile = async (e: ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -425,18 +382,11 @@ export default function JobRequestPage() {
       return;
     }
     setImporting(true);
-    cancelImportRef.current = false;
     try {
       const r = await jobApi.importPrepare(file); // 只解析不入库：先拿到总行数与预检异常
-      const session = r.data;
-      setImportTask({
-        total: session.total, done: 0, succeeded: 0, failed: 0, current: "",
-        errors: [], preInvalid: session.invalid, running: true, finished: false,
-      });
-      await runImport(session);
+      useJobImport.getState().start(r.data);
     } catch (err: any) {
       message.error(err?.response?.data?.detail || "导入失败，请检查文件格式");
-      setImportTask(null);
     } finally {
       setImporting(false);
     }
@@ -444,11 +394,11 @@ export default function JobRequestPage() {
 
   const closeImportModal = () => {
     if (importTask?.running) {
-      cancelImportRef.current = true;
+      useJobImport.getState().stop();
       message.info("已停止剩余行的导入，已入库的岗位不受影响");
       return;
     }
-    setImportTask(null);
+    useJobImport.getState().dismiss();
   };
 
   // ---- 看板统计（饼图口径）：按省份 / 按专业 ----
@@ -654,7 +604,7 @@ export default function JobRequestPage() {
           importTask?.running ? (
             <Button danger onClick={closeImportModal}>停止剩余导入</Button>
           ) : (
-            <Button type="primary" onClick={() => setImportTask(null)}>知道了</Button>
+            <Button type="primary" onClick={closeImportModal}>知道了</Button>
           )
         }
       >
