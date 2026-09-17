@@ -348,8 +348,16 @@ def create_job(body: JobCreate, db: Session = Depends(get_db)):
         raise HTTPException(502, f"岗位结构化失败，岗位未入库：{e}") from e
 
     with timer.stage("入库"):
-        db.add(job)
-        db.commit()
+        try:
+            db.add(job)
+            db.commit()
+        except Exception as e:  # 入库失败（如库表结构缺失/数据库不可用），明确提示而非裸 500
+            db.rollback()
+            logger.exception("岗位入库失败 title=%s", body.title)
+            timer.log(error=f"入库失败: {e}")
+            raise HTTPException(
+                500, f"岗位入库失败（数据库错误：{e}）。请检查数据库表结构是否与模型一致"
+            ) from e
         db.refresh(job)
     submit_heavy_task(_match_job_task, job.id, "job_create",
                       enqueued_at=time.perf_counter())  # 后台匹配在池简历
