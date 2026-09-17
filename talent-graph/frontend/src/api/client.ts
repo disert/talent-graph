@@ -1,6 +1,17 @@
 import axios from "axios";
 
-export const api = axios.create({ baseURL: "/api", timeout: 300000 });
+/**
+ * 后端接口前缀。
+ *
+ * 默认 "/api"（直连后端或容器内 nginx 反代）。
+ * 二级路径部署时由构建参数注入，例如 VITE_API_BASE=/talent-graph/backend/api，
+ * 这样浏览器请求 /talent-graph/backend/api/... 经代理机转发后由容器内 nginx 剥掉前缀。
+ *
+ * 注意：模板下载 / 导出这类**拼字符串给浏览器**的地址也必须用这个前缀，不能写死 /api。
+ */
+export const API_BASE = (import.meta.env.VITE_API_BASE || "/api").replace(/\/+$/, "");
+
+export const api = axios.create({ baseURL: API_BASE, timeout: 300000 });
 
 // ---------- 类型 ----------
 export interface Resume {
@@ -181,7 +192,7 @@ export const jobApi = {
   /** 组织架构树（需求部门多层级级联） */
   departments: () => api.get<DepartmentNode[]>("/jobs/departments"),
   /** 标准 Excel 导入模板下载地址 */
-  importTemplateUrl: "/api/jobs/import/template",
+  importTemplateUrl: `${API_BASE}/jobs/import/template`,
   /** Excel 批量导入岗位（一次性提交，脚本/接口直调用） */
   importJobs: (file: File) => {
     const fd = new FormData();
@@ -204,7 +215,7 @@ export const departmentApi = {
   list: () => api.get<DepartmentNode[]>("/departments"),
   stats: () => api.get<{ total: number }>("/departments/stats"),
   /** 部门层级 Excel 导入模板下载地址 */
-  importTemplateUrl: "/api/departments/import/template",
+  importTemplateUrl: `${API_BASE}/departments/import/template`,
   /** Excel 批量导入部门层级 */
   importExcel: (file: File) => {
     const fd = new FormData();
@@ -232,5 +243,5 @@ export const matchApi = {
   feedback: (matchId: number, result: "selected" | "rejected") =>
     api.post("/match/feedback", { match_id: matchId, result }),
   exportUrl: (jobId: number, withFiles = true) =>
-    `/api/match/${jobId}/export?with_files=${withFiles}`,
+    `${API_BASE}/match/${jobId}/export?with_files=${withFiles}`,
 };

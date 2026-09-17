@@ -40,7 +40,14 @@ services:
     #           capabilities: [gpu]
 
   frontend:
-    build: ./frontend
+    build:
+      context: ./frontend
+      # 二级路径部署（经反向代理挂在 /talent-graph/frontend/）时必须传这两个参数，
+      # 否则浏览器会去代理机的 /assets/xxx.js 取资源（404）→ 页面 #root 为空；
+      # 若前端是直接暴露 20022 端口访问，把 args 整段删掉用默认值（/ 和 /api）即可。
+      args:
+        VITE_BASE_PATH: /talent-graph/frontend/
+        VITE_API_BASE: /talent-graph/backend/api
     image: talent-graph-frontend:latest
     container_name: talent-graph-frontend
     ports:

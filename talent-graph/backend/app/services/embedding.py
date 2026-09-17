@@ -56,15 +56,26 @@ def _prepare_hf_env(path: str) -> bool:
     之后再改环境变量不生效。
 
     离线：命中本地缓存 / 本地目录 -> HF_HUB_OFFLINE=1（快，且不会卡）。
+    硬离线（OFFLINE_MODE=true，内网镜像默认开）：模型不在本地就直接报错，
+          绝不去连 huggingface.co —— 内网连不上又可能被黑洞丢包，会把整条解析队列挂死。
     在线：确实需要首次下载 -> 走镜像（HF_ENDPOINT）+ 有界超时，失败快速抛出，
           不再无限重试把整条解析队列拖死。
     """
     if _model_available_offline(path):
         os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
         logger.info("本地 Embedding 模型命中本地缓存，离线加载（不联网）: %s", path)
         return True
 
+    if settings.offline_mode:
+        raise RuntimeError(
+            f"OFFLINE_MODE=true（内网离线模式），但本地 Embedding 模型 {path} 不在本地缓存。"
+            "二选一：① 把 EMBEDDING_BASE_URL 配成内网平台接口（推荐，镜像已默认这么配）；"
+            "② 在能联网的机器上把模型下好，把目录拷进容器并把 EMBEDDING_LOCAL_PATH 指向它。"
+        )
+
     os.environ.pop("HF_HUB_OFFLINE", None)
+    os.environ.pop("TRANSFORMERS_OFFLINE", None)
     if settings.hf_endpoint:
         os.environ.setdefault("HF_ENDPOINT", settings.hf_endpoint)
     timeout = str(int(settings.hf_timeout))

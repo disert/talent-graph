@@ -48,9 +48,24 @@ function Shell() {
   );
 }
 
+/**
+ * 路由前缀（basename）。
+ *
+ * 挂在二级路径下时（构建参数 VITE_BASE_PATH=/talent-graph/frontend/），浏览器地址是
+ * /talent-graph/frontend/xxx，路由必须挂在同一前缀下，否则匹配不到任何路由 → 白屏。
+ *
+ * 这里做成运行时判断：地址确实在该前缀下才启用，直连 20022 端口访问（地址是 /）时
+ * 自动退回根，同一份构建产物两种访问方式都能用。
+ */
+const CONFIGURED_BASE = import.meta.env.BASE_URL.replace(/\/+$/, "");
+const ROUTER_BASE =
+  CONFIGURED_BASE && window.location.pathname.startsWith(CONFIGURED_BASE)
+    ? CONFIGURED_BASE
+    : "/";
+
 export default function App() {
   return (
-    <BrowserRouter>
+    <BrowserRouter basename={ROUTER_BASE}>
       <Shell />
     </BrowserRouter>
   );

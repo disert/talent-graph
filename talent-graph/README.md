@@ -104,6 +104,16 @@ docker load -i talent-graph-images.tar
 docker compose up -d
 ```
 
+后端镜像约 **2.8GB**（含 PaddleOCR + OCR 模型），tar 包相应变大，导入/拷贝会慢一些。
+
+重建后端镜像（改了 `.env` 或新增 OCR 模型时才需要，有网环境执行）：
+
+```bash
+cd talent-graph
+docker compose build backend        # 默认走清华 PyPI 源
+docker compose build backend --build-arg PIP_INDEX=https://pypi.org/simple   # 需要换源时
+```
+
 - **内网要改配置**：改 `backend/.env` → `docker compose build backend && docker compose up -d --force-recreate backend`。
   配置在镜像里，**必须重建**才生效（重启容器没用）。
 - **`DATABASE_URL` 是例外**：它由 `docker-compose.yml` 的 `environment` 在运行时注入并覆盖镜像内的值
@@ -111,7 +121,22 @@ docker compose up -d
 - **数据**（可选）：命名卷 `talent-graph_pgdata`（库）+ `talent-graph_upload_data`（简历原件）。
   要带历史数据需一并迁移；只迁库不迁原件，导出 ZIP 会标「（原件缺失）」。
 - **安全**：镜像内含明文密钥，不要推到不可信的仓库或外发。
-- **OCR 不可用**：镜像内未安装 PaddleOCR（Dockerfile 里那行是注释状态），扫描件/图片简历会停在解析失败。
+- **OCR（扫描件/图片简历）**：后端镜像内已装 `paddlepaddle 3.3.1` + `paddleocr 3.7.0`，
+  OCR 模型（PP-OCRv6 检测/识别 + 文本行方向）已烘焙到 `/opt/paddlex_models`，运行时**不联网**。
+  ⚠️ 新加模型文件后必须重新 `docker compose build backend`，否则镜像里还是旧缓存。
+- **OCR 提速**：文档方向分类（`PP-LCNet_x1_0_doc_ori`）与 UVDoc 文档矫正已在
+  `services/parser.py::_build_ocr_engine` 里主动关闭（`use_doc_orientation_classify=False`
+  + `use_doc_unwarping=False`）：初始化少载 2 个模型、每页少跑两次网络，简历扫描件几乎无损失。
+  要恢复这两步，改回 `True` 并把对应模型目录补回 `/opt/paddlex_models/official_models`。
+- **离线开关**：`OFFLINE_MODE=true`（`.env` 已烘焙进镜像）。开启后本地 BGE-M3 若不在本地缓存
+  会直接报错，而不是去连 huggingface.co——内网这种请求会一直挂着、把整条解析队列拖死。
+- **挂在二级路径下访问**（例：应用在 `44.149`，内网只能经 `74.32` 的 nginx 转发到 `/talent-graph/...`）：
+  前端必须带构建参数重出镜像，否则页面能打开但 `#root` 空白（资源 `/assets/xxx.js` 在代理机上 404）：
+  ```bash
+  docker compose build frontend       # args 已写在 docker-compose.yml（VITE_BASE_PATH / VITE_API_BASE）
+  ```
+  代理机 nginx 用 `location /talent-graph/frontend { proxy_pass http://<应用机>:20022; }`（**结尾不加斜杠**），
+  后端 location 记得加 `client_max_body_size 100m;`。完整步骤与验收见 `部署说明.md` 附录 B。
 
 ## 使用流程（对应演示主线）
 

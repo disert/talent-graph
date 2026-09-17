@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     hf_endpoint: str = "https://hf-mirror.com"  # 置空则用官方源；显式设 HF_ENDPOINT 环境变量优先生效
     hf_timeout: float = 20.0          # HF 元数据/下载单次超时秒数（不给无限等待的机会）
 
+    # 离线模式（内网镜像默认开，见 .env 的 OFFLINE_MODE）：
+    # 开启后，本地 Embedding 模型不在本地缓存时**直接报错**，而不去连 huggingface.co。
+    # 内网既连不上、也常被黑洞丢包，这种请求会一直挂着把整条解析队列拖死。
+    offline_mode: bool = False
+
     # 文件存储（一期存本地磁盘，二期可换 MinIO）
     upload_dir: str = "./data/uploads"
 
