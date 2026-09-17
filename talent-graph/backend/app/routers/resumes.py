@@ -3,18 +3,21 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
+from .. import timing
+from ..concurrency import ProcessingInterrupted, submit_heavy_task
 from ..config import settings
 from ..database import get_db
 from ..models import Resume
 from ..schemas import ResumeOut, ResumeUpdate
-from ..services import embedding, llm, matching, parser
+from ..services import embedding, llm, matching, metrics, parser
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/resumes", tags=["resumes"])
@@ -26,71 +29,134 @@ ALLOWED_SUFFIX = {".pdf", ".docx", ".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 MAX_NAME_LEN = 64
 
 
-def _match_resume(db, resume: Resume) -> None:
+def _match_resume(db, resume: Resume, timer: timing.StageTimer | None = None) -> None:
     """解析/修正完成后触发简历侧匹配，结果落库 match_results（匹配页直接查该表）。
 
     独立 try：匹配失败（如大模型平台不可用）不能反把简历标记成"解析失败"。
+    timer 传入时把「匹配岗位」作为其中一个阶段计入同一份耗时汇总。
     """
+    resume_id = resume.id   # 匹配内部会 rollback 归还连接，之后 ORM 实例已过期
     try:
-        records = matching.match_resume(db, resume)
-        logger.info("简历 %s 匹配完成，写入 %d 条匹配结果", resume.id, len(records))
+        with timing.stage(timer, "匹配岗位"):
+            records = matching.match_resume(db, resume, timer=timer)
+        logger.info("简历 %s 匹配完成，写入 %d 条匹配结果", resume_id, len(records))
+    except ProcessingInterrupted as e:
+        # 服务正在关闭（Ctrl+C / --reload）：本轮匹配作废，留一行说明即可
+        db.rollback()
+        logger.warning("简历 %s 匹配被服务关闭中断，未写入结果（重启后可在匹配页点「执行匹配」重跑）：%s",
+                       resume_id, e)
     except Exception as e:
         db.rollback()
-        logger.exception("简历 %s 匹配失败: %s", resume.id, e)
+        logger.exception("简历 %s 匹配失败: %s", resume_id, e)
 
 
-def _match_resume_task(resume_id: int) -> None:
+def _match_resume_task(resume_id: int, enqueued_at: float | None = None) -> None:
     """后台任务版：人工修正字段后重新生成 embedding 再匹配（独立会话）。"""
     from ..database import SessionLocal
 
+    timer = timing.StageTimer(f"简历重匹配 id={resume_id}")
+    wait = timing.queue_wait_seconds(enqueued_at)
+    if wait is not None:
+        timer.record("排队等待", wait)
+
     db = SessionLocal()
+    display = ""
     try:
         resume = db.get(Resume, resume_id)
-        if resume is not None:
-            _match_resume(db, resume)
+        if resume is None:
+            timer.note("简历已删除，跳过")
+            return
+        display = resume.name
+        _match_resume(db, resume, timer)
     finally:
         db.close()
+        timer.log()
+        metrics.save(kind="resume_rematch", ref_id=resume_id, name=display,
+                     metrics=timer.as_dict())
 
 
-def _process_resume(resume_id: int, file_path: str) -> None:
-    """后台任务：提取文本 -> LLM 结构化 -> 生成 embedding -> 更新入库 -> 触发匹配。"""
+def _process_resume(resume_id: int, file_path: str, enqueued_at: float | None = None) -> None:
+    """后台任务：提取文本 -> LLM 结构化 -> 生成 embedding -> 更新入库 -> 触发匹配。
+
+    由 `submit_heavy_task` 排入专用工作线程池执行（并发数见 settings.heavy_task_concurrency），
+    不会占用 FastAPI 请求线程。
+
+    enqueued_at 为接口侧提交任务的时刻，用于把「排队等待」也算进耗时汇总
+    （批量上传时排队时间常比解析本身还长，不区分会误判成解析慢）。
+    """
     from ..database import SessionLocal
 
+    timer = timing.StageTimer(f"简历处理 id={resume_id} file={Path(file_path).name}")
+    wait = timing.queue_wait_seconds(enqueued_at)
+    if wait is not None:
+        timer.record("排队等待", wait)
+
     db = SessionLocal()
+    failed = ""
+    display = Path(file_path).name          # 报表展示名：解析成功后被姓名覆盖
     try:
-        raw_text = parser.extract_text(file_path)
-        structured, confidence = llm.extract_resume_fields(raw_text)
-        emb = embedding.embed_one(embedding.resume_to_text(structured, raw_text))
+        with timer.stage("文本提取/OCR"):
+            raw_text = parser.extract_text(file_path)
+        timer.note(f"文本{len(raw_text)}字")
+
+        with timer.stage("大模型结构化"):
+            structured, confidence = llm.extract_resume_fields(raw_text)
+
+        with timer.stage("embedding"):
+            emb = embedding.embed_one(embedding.resume_to_text(structured, raw_text))
 
         resume = db.get(Resume, resume_id)
         if resume is None:
+            timer.note("简历已删除，跳过入库")
             return
-        resume.raw_text = raw_text
-        resume.structured = structured
-        resume.confidence = confidence
-        resume.embedding = emb
-        resume.name = (structured.get("name") or resume.name)[:MAX_NAME_LEN]
-        db.commit()
-        logger.info("简历解析完成 id=%s name=%s", resume_id, resume.name)
-        _match_resume(db, resume)
-    except Exception as e:
-        logger.exception("简历解析失败 id=%s: %s", resume_id, e)
-        resume = db.get(Resume, resume_id)
-        if resume is not None:
-            resume.confidence = {"_error": str(e)}
+        with timer.stage("入库"):
+            resume.raw_text = raw_text
+            resume.structured = structured
+            resume.confidence = confidence
+            resume.embedding = emb
+            resume.name = (structured.get("name") or resume.name)[:MAX_NAME_LEN]
+            display = resume.name
             db.commit()
+        logger.info("简历解析完成 id=%s name=%s", resume_id, resume.name)
+        _match_resume(db, resume, timer)
+    except Exception as e:
+        interrupted = isinstance(e, ProcessingInterrupted)
+        failed = ("服务正在关闭，解析被中断（重启后请点「重新解析」）" if interrupted
+                  else str(e)[:200])
+        if interrupted:
+            logger.warning("简历 %s 解析被服务关闭中断：%s", resume_id, e)
+        else:
+            logger.exception("简历解析失败 id=%s: %s", resume_id, e)
+        # commit 失败后会话处于"待回滚"状态，必须先 rollback，否则 db.get 会抛
+        # PendingRollbackError，_error 永远写不进去，简历会一直卡在「解析中」
+        db.rollback()
+        try:
+            resume = db.get(Resume, resume_id)
+            if resume is not None:
+                resume.confidence = {"_error": failed}
+                db.commit()
+        except Exception:
+            logger.exception("写回解析失败原因时再次出错 id=%s", resume_id)
     finally:
         db.close()
+        # 汇总行放在最后：所有阶段（含失败前已完成的）耗时一次看全
+        timer.log(error=failed)
+        # 落库：整批任务跑完后由 concurrency 汇总打印（前台控制台看不到时也能查库）
+        metrics.save(kind="resume_parse", ref_id=resume_id, name=display,
+                     metrics=timer.as_dict(), error=failed)
 
 
 @router.post("/upload", response_model=list[ResumeOut])
 def upload_resumes(
     files: list[UploadFile],
-    background_tasks: BackgroundTasks,
     source: str = Query("", description="渠道：猎头/校园/邮箱/交流会"),
     db: Session = Depends(get_db),
 ):
-    """批量上传简历，立即返回占位记录，解析走后台任务（一期免 Celery）。"""
+    """批量上传简历，立即返回占位记录，解析走后台任务队列（一期免 Celery）。
+
+    这里只统计「接口侧耗时」（接收落盘 + 入库 + 入队）；OCR/LLM/embedding/匹配属于后台
+    任务，由 `_process_resume` 自己打一行阶段耗时汇总。
+    """
     upload_dir = Path(settings.upload_dir)
     upload_dir.mkdir(parents=True, exist_ok=True)
 
@@ -100,36 +166,50 @@ def upload_resumes(
         if suffix not in ALLOWED_SUFFIX:
             raise HTTPException(400, f"不支持的文件类型: {f.filename}")
 
+    batch_timer = timing.StageTimer(f"简历上传批次 files={len(files)}")
     created: list[Resume] = []
     failed: list[str] = []
     for f in files:
         # 逐文件容错：单个文件失败不影响同批其他文件
+        file_timer = timing.StageTimer(f"简历上传 file={f.filename}")
         try:
             suffix = Path(f.filename or "").suffix.lower()
             save_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
-            save_path.write_bytes(f.file.read())
+            with file_timer.stage("接收落盘"):
+                data = f.file.read()
+                save_path.write_bytes(data)
+            file_timer.note(f"{len(data) / 1024 / 1024:.2f}MB")
 
-            resume = Resume(
-                name=Path(f.filename or "未命名").stem[:MAX_NAME_LEN],
-                file_path=str(save_path),
-                source=source,
-                status="in_pool",
-                confidence={"_parsing": True},  # 标记解析中
-            )
-            db.add(resume)
-            db.commit()
-            db.refresh(resume)
-            background_tasks.add_task(_process_resume, resume.id, str(save_path))
+            with file_timer.stage("入库"):
+                resume = Resume(
+                    name=Path(f.filename or "未命名").stem[:MAX_NAME_LEN],
+                    file_path=str(save_path),
+                    source=source,
+                    status="in_pool",
+                    confidence={"_parsing": True},  # 标记解析中
+                )
+                db.add(resume)
+                db.commit()
+                db.refresh(resume)
+            submit_heavy_task(_process_resume, resume.id, str(save_path),
+                              enqueued_at=time.perf_counter())
+            file_timer.note(f"id={resume.id}")
             created.append(resume)
         except Exception as e:
             db.rollback()
             logger.exception("简历入库失败 file=%s: %s", f.filename, e)
             failed.append(f"{f.filename}: {e}")
+            file_timer.log(error=str(e))
+            continue
+        file_timer.log()
 
+    batch_timer.note(f"成功{len(created)} 失败{len(failed)}")
     if not created:
+        batch_timer.log(error="全部上传失败；" + "；".join(failed))
         raise HTTPException(400, "全部上传失败；" + "；".join(failed))
     if failed:
         logger.warning("部分简历上传失败: %s", failed)
+    batch_timer.log()
     return created
 
 
@@ -316,14 +396,19 @@ def get_resume_raw(resume_id: int, db: Session = Depends(get_db)):
 
 
 @router.patch("/{resume_id}", response_model=ResumeOut)
-def update_resume(resume_id: int, body: ResumeUpdate, background_tasks: BackgroundTasks,
+def update_resume(resume_id: int, body: ResumeUpdate,
                   db: Session = Depends(get_db)):
-    """人工修正低置信字段 / 更新状态标签。修正后重新生成 embedding 并后台重跑匹配。"""
+    """人工修正低置信字段 / 更新状态标签。修正后重新生成 embedding 并后台重跑匹配。
+
+    请求内只统计 embedding 重算耗时；后续的完整重匹配在后台任务里另打一行汇总。
+    """
+    timer = timing.StageTimer(f"简历修正 id={resume_id}")
     resume = db.get(Resume, resume_id)
     if resume is None:
         raise HTTPException(404, "简历不存在")
 
     rematch = False
+    embed_text: str | None = None
     if body.status:
         if body.status not in ("in_pool", "pushed", "selected", "rejected", "withdrawn"):
             raise HTTPException(400, "非法状态")
@@ -335,15 +420,21 @@ def update_resume(resume_id: int, body: ResumeUpdate, background_tasks: Backgrou
         resume.structured = {**(resume.structured or {}), **body.structured}
         resume.confidence = {k: v for k, v in (resume.confidence or {}).items()
                              if k not in body.structured}  # 修正过的字段清掉低置信标记
-        resume.embedding = embedding.embed_one(
-            embedding.resume_to_text(resume.structured, resume.raw_text)
-        )
+        embed_text = embedding.resume_to_text(resume.structured, resume.raw_text)
         rematch = True
+    if embed_text is not None:
+        # 先把字段修改落库并归还连接：embedding 计算（首次可能触发模型加载，几十秒）
+        # 期间不占用连接池名额，否则并发修正会拖垮其他请求
+        db.commit()
+        with timer.stage("embedding"):
+            resume.embedding = embedding.embed_one(embed_text)
     db.commit()
     db.refresh(resume)
     if rematch:
         # 关键字段变了，历史匹配结果已失效，后台重跑覆盖 match_results
-        background_tasks.add_task(_match_resume_task, resume.id)
+        submit_heavy_task(_match_resume_task, resume.id, enqueued_at=time.perf_counter())
+        timer.note("已排后台重匹配")
+    timer.log()
     return resume
 
 
@@ -364,8 +455,7 @@ def delete_resume(resume_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/{resume_id}/reparse", response_model=ResumeOut)
-def reparse_resume(resume_id: int, background_tasks: BackgroundTasks,
-                   db: Session = Depends(get_db)):
+def reparse_resume(resume_id: int, db: Session = Depends(get_db)):
     """对解析失败 / 卡在解析中的简历重新触发解析。"""
     resume = db.get(Resume, resume_id)
     if resume is None:
@@ -375,5 +465,7 @@ def reparse_resume(resume_id: int, background_tasks: BackgroundTasks,
     resume.confidence = {"_parsing": True}
     db.commit()
     db.refresh(resume)
-    background_tasks.add_task(_process_resume, resume.id, resume.file_path)
+    submit_heavy_task(_process_resume, resume.id, resume.file_path,
+                      enqueued_at=time.perf_counter())
+    logger.info("简历重新解析已入队 id=%s file=%s", resume.id, resume.file_path)
     return resume

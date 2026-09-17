@@ -10,10 +10,11 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 
+from .. import timing
 from ..database import get_db
 from ..models import JobRequest, MatchResult, Resume
 from ..schemas import FeedbackRequest, MatchOut, MatchRunOut, PushRequest
-from ..services import exporter, matching
+from ..services import exporter, matching, metrics
 
 router = APIRouter(prefix="/api/match", tags=["match"])
 
@@ -37,7 +38,12 @@ def run_match(job_id: int, db: Session = Depends(get_db)):
     job = db.get(JobRequest, job_id)
     if job is None:
         raise HTTPException(404, "岗位不存在")
-    total, records = matching.match_job(db, job, source="manual")
+    timer = timing.StageTimer(f"匹配重跑 job_id={job_id}")
+    job_title = job.title          # 匹配内部会 rollback 归还连接，实例随即过期，先取纯值
+    total, records = matching.match_job(db, job, source="manual", timer=timer)
+    timer.note(f"写入{len(records)}条")
+    timer.log()
+    metrics.save(kind="job_match", ref_id=job_id, name=job_title, metrics=timer.as_dict())
     return MatchRunOut(job_id=job_id, total_after_hard_filter=total,
                        candidates=[_to_out(r) for r in records])
 

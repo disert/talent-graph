@@ -6,7 +6,15 @@ from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from .config import settings
 
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+engine = create_engine(
+    settings.database_url,
+    pool_pre_ping=True,
+    # 批量上传简历时，后台解析/匹配任务会同时取连接，默认 5+10 不够用（见 config.py 注释）
+    pool_size=settings.db_pool_size,
+    max_overflow=settings.db_max_overflow,
+    pool_timeout=settings.db_pool_timeout,
+    pool_recycle=settings.db_pool_recycle,
+)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -20,6 +28,22 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def release_connection(db) -> None:
+    """结束当前事务、把连接归还连接池。
+
+    **必须在秒级~分钟级的阻塞 I/O（LLM 调用 / OCR / embedding 推理）之前调用。**
+
+    Session 在第一次查询时就 check out 一个连接并保持事务打开，直到 commit/rollback/close。
+    如果在 `db.scalars(...)` 之后直接去调大模型，连接会以 `idle in transaction` 状态被占用
+    几十秒；并发上传时连接池很快被占满，其他请求只能等 30s 后抛
+    `QueuePool limit ... connection timed out`。
+
+    注意：rollback 会让会话内所有 ORM 实例过期（expire_on_commit 只影响 commit），
+    所以调用前要先把后续需要的数据提取成纯 Python 值（id / dict），不要传 ORM 对象。
+    """
+    db.rollback()
 
 
 def _sqlite_add_missing_columns() -> None:

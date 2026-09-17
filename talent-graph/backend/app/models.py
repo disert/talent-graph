@@ -4,7 +4,7 @@ from typing import Optional
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
-    JSON, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
+    JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -123,3 +123,28 @@ class MatchResult(Base):
 
     job: Mapped[JobRequest] = relationship(back_populates="matches")
     resume: Mapped[Resume] = relationship(back_populates="matches")
+
+
+class PipelineMetric(Base):
+    """各阶段处理耗时（简历解析 / 岗位录入 / 匹配）的落库记录。
+
+    写入方：`services/metrics.py::save()`，由后台任务在结束时调用（独立短事务，失败不影响业务）。
+    读取方：同一批任务被队列消化完后，`concurrency.py` 触发 `print_batch_report()` 打印汇总表。
+
+    `batch_id` 为**进程内生成的 uuid**（不是自增整数）：一次上传/一次导入属于同一批，
+    进程重启后也不会与上一批历史记录撞号；`stages` 存 {"阶段名": 秒}，
+    阶段名由 `timing.StageTimer` 打点产生（如「文本提取/OCR」「大模型结构化」「embedding」「LLM精排」）。
+    """
+    __tablename__ = "pipeline_metrics"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(32), index=True, default="")
+    kind: Mapped[str] = mapped_column(String(24), index=True, default="")   # resume_parse / job_match ...
+    ref_id: Mapped[int] = mapped_column(Integer, default=0)                 # 简历 id / 岗位 id
+    name: Mapped[str] = mapped_column(String(128), default="")              # 简历姓名 / 岗位名称（报表展示）
+    stages: Mapped[dict] = mapped_column(JSON, default=dict)                # {"阶段名": 秒}
+    total_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    ok: Mapped[bool] = mapped_column(Boolean, default=True)
+    error: Mapped[str] = mapped_column(String(255), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+

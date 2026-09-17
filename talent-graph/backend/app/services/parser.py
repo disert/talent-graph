@@ -4,6 +4,8 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +13,9 @@ logger = logging.getLogger(__name__)
 
 _ocr_engine = None          # PaddleOCR 懒加载
 _ocr_init_error: str | None = None   # 初始化失败原因（避免每次上传都重试一遍慢失败）
+# PaddleOCR 初始化很重（要载入 4 个模型），且 C++ 推理层不是线程安全的：
+# 并发解析时既会重复初始化，也可能直接 native crash。这里统一串行化。
+_ocr_lock = threading.Lock()
 
 
 def _is_ascii(text: str) -> bool:
@@ -127,27 +132,36 @@ def _collect_ocr_text(result) -> list[str]:
 def _extract_pdf(path: Path) -> str:
     import fitz  # PyMuPDF
 
+    t0 = time.perf_counter()
     text_parts: list[str] = []
     with fitz.open(path) as doc:
+        pages = doc.page_count
         for page in doc:
             text_parts.append(page.get_text())
     text = "\n".join(text_parts).strip()
     if len(text) < 50:  # 判定为扫描件，回退 OCR
-        logger.info("PDF 文本过少，按扫描件走 OCR: %s", path.name)
+        logger.info("PDF 文本过少（%d 字 / %d 页），按扫描件走 OCR: %s",
+                    len(text), pages, path.name)
         return _extract_pdf_ocr(path)
+    logger.info("PDF 文本直取完成：%s，%d 页 / %d 字，耗时 %.2fs",
+                path.name, pages, len(text), time.perf_counter() - t0)
     return text
 
 
 def _extract_pdf_ocr(path: Path) -> str:
     import fitz
 
+    t0 = time.perf_counter()
     texts: list[str] = []
     with fitz.open(path) as doc:
         for page in doc:
             pix = page.get_pixmap(dpi=200)
             img_bytes = pix.tobytes("png")
             texts.append(_ocr_image_bytes(img_bytes))
-    return "\n".join(texts)
+    text = "\n".join(texts)
+    logger.info("扫描件 OCR 完成：%s，%d 页 / %d 字，耗时 %.2fs",
+                path.name, len(texts), len(text), time.perf_counter() - t0)
+    return text
 
 
 def _extract_docx(path: Path) -> str:
@@ -173,43 +187,67 @@ def _ocr_image_bytes(img_bytes: bytes) -> str:
         raise ValueError(f"OCR 引擎不可用（初始化时失败）：{_ocr_init_error}")
 
     if _ocr_engine is None:
-        _prepare_paddlex_home()          # 必须早于 import paddleocr
-        try:
-            _ocr_engine = _build_ocr_engine()
-        except ImportError as e:
-            raise ValueError(
-                "该文件为扫描件/图片，需要 OCR 才能解析，但当前环境未安装 paddleocr。"
-                "请在 backend 环境执行：pip install paddlepaddle paddleocr 后重新解析。"
-            ) from e
-        except Exception as e:
-            logger.exception("OCR 引擎初始化失败")
-            _ocr_init_error = str(e)
-            raise ValueError(
-                f"OCR 引擎初始化失败：{e}。"
-                "常见原因：内网无法下载 OCR 模型，或模型缓存目录不可写（详见后端日志）。"
-            ) from e
+        with _ocr_lock:                  # 并发解析时只初始化一次
+            if _ocr_engine is None:
+                if _ocr_init_error:      # 等锁期间别的线程已确认初始化失败
+                    raise ValueError(f"OCR 引擎不可用（初始化时失败）：{_ocr_init_error}")
+                _prepare_paddlex_home()  # 必须早于 import paddleocr
+                try:
+                    init_start = time.perf_counter()
+                    _ocr_engine = _build_ocr_engine()
+                    # 首次初始化要载入 4 个模型（含下载），常常是整条链上最慢的一步
+                    logger.info("PaddleOCR 引擎初始化完成，耗时 %.2fs",
+                                time.perf_counter() - init_start)
+                except ImportError as e:
+                    raise ValueError(
+                        "该文件为扫描件/图片，需要 OCR 才能解析，但当前环境未安装 paddleocr。"
+                        "请在 backend 环境执行：pip install paddlepaddle paddleocr 后重新解析。"
+                    ) from e
+                except Exception as e:
+                    logger.exception("OCR 引擎初始化失败")
+                    _ocr_init_error = str(e)
+                    raise ValueError(
+                        f"OCR 引擎初始化失败：{e}。"
+                        "常见原因：内网无法下载 OCR 模型，或模型缓存目录不可写（详见后端日志）。"
+                    ) from e
 
     import io
 
     img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+    lock_start = time.perf_counter()
     try:
-        result = _run_ocr(_ocr_engine, img)
+        # 识别阶段同样加锁：PaddleOCR 的 C++ 推理不保证线程安全，
+        # 并发调用在 Windows 上实测会卡死/崩溃（OCR 在后台任务里跑，串行化可接受）。
+        with _ocr_lock:
+            lock_wait = time.perf_counter() - lock_start
+            recog_start = time.perf_counter()
+            result = _run_ocr(_ocr_engine, img)
+            recog_seconds = time.perf_counter() - recog_start
     except Exception as e:
         logger.exception("OCR 文字识别失败")
         raise ValueError(f"OCR 文字识别失败：{e}") from e
-    return "\n".join(_collect_ocr_text(result))
+    lines = _collect_ocr_text(result)
+    # 「等锁」= 被其他并发解析任务挡住的时间，与真正的识别耗时分开看才能判断该调并发还是调 CPU
+    logger.info("OCR 识别完成：等锁 %.2fs + 识别 %.2fs，输出 %d 行文本",
+                lock_wait, recog_seconds, len(lines))
+    return "\n".join(lines)
 
 
 def extract_text(path: str | Path) -> str:
     """按扩展名分发提取。支持 .pdf/.docx/.doc(提示转docx)/.png/.jpg。"""
     path = Path(path)
     suffix = path.suffix.lower()
+    start = time.perf_counter()
     if suffix == ".pdf":
-        return _extract_pdf(path)
-    if suffix in (".docx",):
-        return _extract_docx(path)
-    if suffix in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
-        return _ocr_image_bytes(path.read_bytes())
-    if suffix == ".doc":
+        text = _extract_pdf(path)
+    elif suffix in (".docx",):
+        text = _extract_docx(path)
+    elif suffix in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+        text = _ocr_image_bytes(path.read_bytes())
+    elif suffix == ".doc":
         raise ValueError("旧版 .doc 请先转换为 .docx 再上传")
-    raise ValueError(f"不支持的文件类型: {suffix}")
+    else:
+        raise ValueError(f"不支持的文件类型: {suffix}")
+    logger.info("文本提取完成：%s（%s），%d 字，耗时 %.2fs",
+                path.name, suffix, len(text), time.perf_counter() - start)
+    return text

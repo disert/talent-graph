@@ -1,7 +1,10 @@
-import { FileSearchOutlined, FileTextOutlined, PartitionOutlined, UploadOutlined } from "@ant-design/icons";
+import {
+  FileSearchOutlined, FileTextOutlined, FormOutlined, PartitionOutlined, UploadOutlined,
+} from "@ant-design/icons";
 import { Layout, Menu, Typography } from "antd";
 import { BrowserRouter, Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
-import JobRequestPage from "./pages/JobRequest";
+import JobCreatePage from "./pages/JobCreate";
+import JobLibraryPage from "./pages/JobLibrary";
 import MatchResultPage from "./pages/MatchResult";
 import ResumeLibraryPage from "./pages/ResumeLibrary";
 import ResumeUploadPage from "./pages/ResumeUpload";
@@ -12,7 +15,8 @@ function Shell() {
   const location = useLocation();
   const items = [
     { key: "/upload", icon: <UploadOutlined />, label: <Link to="/upload">简历上传解析</Link> },
-    { key: "/jobs", icon: <FileTextOutlined />, label: <Link to="/jobs">岗位需求录入</Link> },
+    { key: "/jobs/create", icon: <FormOutlined />, label: <Link to="/jobs/create">岗位录入</Link> },
+    { key: "/jobs/library", icon: <FileTextOutlined />, label: <Link to="/jobs/library">已录入岗位</Link> },
     { key: "/match", icon: <PartitionOutlined />, label: <Link to="/match">匹配结果</Link> },
     { key: "/library", icon: <FileSearchOutlined />, label: <Link to="/library">简历库检索</Link> },
   ];
@@ -31,7 +35,10 @@ function Shell() {
           <Routes>
             <Route path="/" element={<Navigate to="/upload" replace />} />
             <Route path="/upload" element={<ResumeUploadPage />} />
-            <Route path="/jobs" element={<JobRequestPage />} />
+            {/* 旧路径 /jobs 保留兼容：重定向到岗位录入页 */}
+            <Route path="/jobs" element={<Navigate to="/jobs/create" replace />} />
+            <Route path="/jobs/create" element={<JobCreatePage />} />
+            <Route path="/jobs/library" element={<JobLibraryPage />} />
             <Route path="/match" element={<MatchResultPage />} />
             <Route path="/library" element={<ResumeLibraryPage />} />
           </Routes>

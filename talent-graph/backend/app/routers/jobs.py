@@ -9,15 +9,17 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Response, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from .. import timing
+from ..concurrency import ProcessingInterrupted, submit_heavy_task
 from ..database import get_db
 from ..models import JobRequest
 from ..schemas import (JobCreate, JobImportItem, JobImportResult, JobImportSessionOut,
                        JobImportStepIn, JobImportStepOut, JobOut)
-from ..services import departments, embedding, llm, matching
+from ..services import departments, embedding, llm, matching, metrics
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -35,26 +37,47 @@ _IMPORT_MAX_SESSIONS = 20
 
 # ---------- 工具函数 ----------
 
-def _match_job_task(job_id: int, source: str = "job_create") -> None:
+def _match_job_task(job_id: int, source: str = "job_create",
+                    enqueued_at: float | None = None) -> None:
     """后台任务：岗位入库后与全部在池简历跑两级匹配，结果落库 match_results。
 
-    岗位结构化只花一次 LLM 调用就返回，匹配（多条 LLM 精排）放后台不阻塞录入。
+    岗位结构化只花一次 LLM 调用就返回，匹配（多条 LLM 精排）放后台任务队列不阻塞录入。
+    enqueued_at 为接口侧提交时刻，用于把「排队等待」也算进耗时汇总。
     """
     from ..database import SessionLocal
 
+    timer = timing.StageTimer(f"岗位匹配 id={job_id} source={source}")
+    wait = timing.queue_wait_seconds(enqueued_at)
+    if wait is not None:
+        timer.record("排队等待", wait)
+
     db = SessionLocal()
+    failed = ""
+    display = ""
     try:
         job = db.get(JobRequest, job_id)
         if job is None:
+            timer.note("岗位已删除，跳过")
             return
-        total, records = matching.match_job(db, job, source=source)
+        # 先取纯值：下面的匹配会 rollback 归还连接，ORM 实例随即过期
+        display = job.title
+        total, records = matching.match_job(db, job, source=source, timer=timer)
         logger.info("岗位 %s 匹配完成：硬性过滤通过 %d 份，写入 %d 条匹配结果",
                     job_id, total, len(records))
+    except ProcessingInterrupted as e:
+        # 服务正在关闭：本轮匹配作废，不当失败处理
+        db.rollback()
+        logger.warning("岗位 %s 匹配被服务关闭中断，未写入结果（重启后可在匹配页点「执行匹配」重跑）：%s",
+                       job_id, e)
     except Exception as e:
+        failed = str(e)[:200]
         db.rollback()
         logger.exception("岗位 %s 匹配失败: %s", job_id, e)
     finally:
         db.close()
+        timer.log(error=failed)
+        metrics.save(kind="job_match", ref_id=job_id, name=display,
+                     metrics=timer.as_dict(), error=failed)
 
 
 def _embed_or_none(text: str) -> list[float] | None:
@@ -77,17 +100,20 @@ def _normalize_department(department: str, department_path: list[str]) -> tuple[
 
 
 def _build_job_payload(*, db: Session, title: str, department: str, department_path: list[str],
-                       province: str, majors: list[str], raw_text: str) -> JobRequest:
+                       province: str, majors: list[str], raw_text: str,
+                       timer: timing.StageTimer | None = None) -> JobRequest:
     """LLM 结构化需求 -> 组装 JobRequest 对象（显式专业并入硬性条件，保证硬过滤生效）。
 
     province 留空时由所选部门路径在组织架构中的省份推导（子部门默认继承上级）。
+    timer 传入时把「大模型结构化」「embedding」两段耗时计入调用方汇总。
     """
     if not title:
         raise ValueError("缺少岗位名称")
     if not raw_text:
         raise ValueError("缺少需求描述")
 
-    result = llm.structure_job_request(raw_text)
+    with timing.stage(timer, "大模型结构化"):
+        result = llm.structure_job_request(raw_text)
     hard = dict(result.get("hard_conditions") or {})
     soft = dict(result.get("soft_conditions") or {})
     summary = str(result.get("summary") or "")
@@ -100,6 +126,8 @@ def _build_job_payload(*, db: Session, title: str, department: str, department_p
 
     dept_str, dept_path = _normalize_department(department, department_path)
     final_province = (province or "").strip() or departments.resolve_province(db, dept_path)
+    with timing.stage(timer, "embedding"):
+        embedding_vec = _embed_or_none(embedding.job_to_text(title, soft, summary))
     return JobRequest(
         title=title,
         department=dept_str,
@@ -109,23 +137,26 @@ def _build_job_payload(*, db: Session, title: str, department: str, department_p
         raw_text=raw_text,
         hard_conditions=hard,
         soft_conditions=soft,
-        embedding=_embed_or_none(embedding.job_to_text(title, soft, summary)),
+        embedding=embedding_vec,
     )
 
 
 def _import_one_row(db: Session, item: dict,
-                    background_tasks: BackgroundTasks) -> tuple[bool, int | None, str]:
+                    timer: timing.StageTimer | None = None) -> tuple[bool, int | None, str]:
     """导入单行：LLM 结构化 + 入库 + 排后台匹配。返回 (是否成功, 岗位 id, 失败原因)。"""
     try:
         job = _build_job_payload(
             db=db, title=item.get("title") or "", department=item.get("department") or "",
             department_path=[], province=item.get("province") or "",
             majors=item.get("majors") or [], raw_text=item.get("raw_text") or "",
+            timer=timer,
         )
-        db.add(job)
-        db.commit()
-        db.refresh(job)
-        background_tasks.add_task(_match_job_task, job.id, "job_create")
+        with timing.stage(timer, "入库"):
+            db.add(job)
+            db.commit()
+            db.refresh(job)
+        submit_heavy_task(_match_job_task, job.id, "job_create",
+                          enqueued_at=time.perf_counter())
         return True, job.id, ""
     except ValueError as e:      # 行数据不完整（缺岗位名称/需求描述）
         db.rollback()
@@ -286,34 +317,45 @@ def _build_template_bytes() -> bytes:
 # ---------- 接口 ----------
 
 @router.post("", response_model=JobOut)
-def create_job(body: JobCreate, background_tasks: BackgroundTasks,
-               db: Session = Depends(get_db)):
+def create_job(body: JobCreate, db: Session = Depends(get_db)):
     """提交自然语言岗位需求，LLM 结构化为硬性/择优条件并生成 embedding。
 
     严格失败策略：大模型平台不可达/结构化失败时不入库，返回明确错误，
     避免保存“空条件”岗位干扰后续匹配。入库后后台触发与在池简历的匹配。
+
+    请求内统计「大模型结构化 / embedding / 入库」耗时；匹配在后台任务里另打一行汇总。
     """
+    timer = timing.StageTimer(f"岗位录入 title={body.title}")
     try:
         job = _build_job_payload(
             db=db, title=body.title, department=body.department,
             department_path=body.department_path, province=body.province,
             majors=body.majors, raw_text=body.raw_text,
+            timer=timer,
         )
     except ValueError as e:  # 缺岗位名称 / 缺需求描述等
+        timer.log(error=str(e))
         raise HTTPException(400, str(e)) from e
     except RuntimeError as e:  # LLM 结构化失败（连接/解析）
         logger.warning("岗位 AI 结构化失败，未入库 title=%s: %s", body.title, e)
+        timer.log(error=f"AI 结构化失败: {e}")
         raise HTTPException(
             503, "AI 结构化服务暂不可用（大模型平台连接失败），岗位未入库。请稍后重试，或检查 backend/.env 的大模型配置。"
         ) from e
     except Exception as e:
         logger.exception("岗位结构化异常 title=%s", body.title)
+        timer.log(error=str(e))
         raise HTTPException(502, f"岗位结构化失败，岗位未入库：{e}") from e
 
-    db.add(job)
-    db.commit()
-    db.refresh(job)
-    background_tasks.add_task(_match_job_task, job.id, "job_create")  # 后台匹配在池简历
+    with timer.stage("入库"):
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+    submit_heavy_task(_match_job_task, job.id, "job_create",
+                      enqueued_at=time.perf_counter())  # 后台匹配在池简历
+    timer.note(f"id={job.id}")
+    timer.log()
+    metrics.save(kind="job_create", ref_id=job.id, name=job.title, metrics=timer.as_dict())
     return job
 
 
@@ -324,7 +366,7 @@ def list_departments(db: Session = Depends(get_db)):
 
 
 @router.post("/import", response_model=JobImportResult)
-def import_jobs(file: UploadFile, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+def import_jobs(file: UploadFile, db: Session = Depends(get_db)):
     """Excel 批量导入岗位（一次性提交版）。逐行容错：单行失败不影响其他行；LLM 逐条结构化。
 
     前端「导入 Excel」走 /import/prepare + /import/step 以便显示进度条；
@@ -335,14 +377,22 @@ def import_jobs(file: UploadFile, background_tasks: BackgroundTasks, db: Session
         raise HTTPException(400, "仅支持 .xlsx / .xlsm 格式（可先下载模板）")
     rows = _read_import_rows(file.file)
 
+    batch_timer = timing.StageTimer(f"岗位导入(一次性) file={file.filename} rows={len(rows)}")
     result = JobImportResult(total=len(rows))
     for item in rows:
-        ok, _job_id, error = _import_one_row(db, item, background_tasks)
+        item_timer = timing.StageTimer(f"岗位导入 第{item['row']}行 title={item.get('title')}")
+        ok, job_id, error = _import_one_row(db, item, timer=item_timer)
         if ok:
             result.succeeded += 1
+            item_timer.note(f"id={job_id}")
         else:
             result.failed += 1
             result.errors.append({"row": item["row"], "message": error})
+        item_timer.log(error=error)
+        metrics.save(kind="job_create", ref_id=job_id or 0, name=item.get("title") or "",
+                     metrics=item_timer.as_dict(), error=error)
+    batch_timer.note(f"成功{result.succeeded} 失败{result.failed}")
+    batch_timer.log()
     return result
 
 
@@ -373,8 +423,7 @@ def prepare_import(file: UploadFile, db: Session = Depends(get_db)):
 
 
 @router.post("/import/step", response_model=JobImportStepOut)
-def import_step(body: JobImportStepIn, background_tasks: BackgroundTasks,
-                db: Session = Depends(get_db)):
+def import_step(body: JobImportStepIn, db: Session = Depends(get_db)):
     """导入会话中的第 index 行：入库并排后台匹配，返回该行结果。
 
     前端循环调用以推进进度条；每行独立事务，失败不阻塞后续行。
@@ -388,7 +437,14 @@ def import_step(body: JobImportStepIn, background_tasks: BackgroundTasks,
         raise HTTPException(400, f"导入行序号越界：{body.index}")
 
     item = items[body.index]
-    ok, job_id, error = _import_one_row(db, item, background_tasks)
+    # 每行一次日志：前端进度条 + 后端逐行耗时，批量导入慢时能一眼看出卡在哪一行
+    item_timer = timing.StageTimer(f"岗位导入 第{item['row']}行 title={item.get('title')}")
+    ok, job_id, error = _import_one_row(db, item, timer=item_timer)
+    if ok:
+        item_timer.note(f"id={job_id}")
+    item_timer.log(error=error)
+    metrics.save(kind="job_create", ref_id=job_id or 0, name=item.get("title") or "",
+                 metrics=item_timer.as_dict(), error=error)
     return JobImportStepOut(row=item["row"], title=item.get("title") or "",
                             ok=ok, job_id=job_id, error=error)
 

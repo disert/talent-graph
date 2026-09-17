@@ -38,19 +38,34 @@ def _chat(messages: list[dict[str, str]], json_mode: bool = True) -> str:
 
     last_err: Exception | None = None
     for attempt in range(settings.llm_max_retries):
+        start = time.perf_counter()
         try:
             resp = get_client().chat.completions.create(
                 model=settings.llm_model, messages=messages, temperature=0.1, **kwargs
             )
+            _log_call_seconds(time.perf_counter() - start, attempt)
             return resp.choices[0].message.content or ""
         except Exception as e:  # 平台不支持 json 模式时降级
             if json_mode and "response_format" in str(e):
                 return _chat_no_json(messages)
             last_err = e
             wait = 2 ** attempt
-            logger.warning("LLM 调用失败（第 %d 次），%ds 后重试: %s", attempt + 1, wait, e)
+            logger.warning("LLM 调用失败（第 %d 次，已耗时 %.2fs），%ds 后重试: %s",
+                           attempt + 1, time.perf_counter() - start, wait, e)
             time.sleep(wait)
     raise RuntimeError(f"LLM 调用连续失败 {settings.llm_max_retries} 次: {last_err}")
+
+
+# 单次大模型调用超过该秒数就记一条 INFO（逐条精排会有成百上千次调用，全部打日志太吵）
+_LLM_SLOW_SECONDS = 5.0
+
+
+def _log_call_seconds(seconds: float, attempt: int) -> None:
+    """单次 LLM 调用耗时：常规走 DEBUG，偏慢才升到 INFO，便于定位"哪次调用卡住了"。"""
+    if seconds >= _LLM_SLOW_SECONDS:
+        logger.info("LLM 单次调用耗时 %.2fs（第 %d 次尝试）", seconds, attempt + 1)
+    else:
+        logger.debug("LLM 单次调用耗时 %.2fs（第 %d 次尝试）", seconds, attempt + 1)
 
 
 def _chat_no_json(messages: list[dict[str, str]]) -> str:
@@ -61,15 +76,32 @@ def _chat_no_json(messages: list[dict[str, str]]) -> str:
 
 
 def _extract_json(text: str) -> dict[str, Any]:
-    """从模型输出中稳健地提取 JSON 对象。"""
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", text, re.DOTALL)
-        if m:
-            return json.loads(m.group(0))
-        raise ValueError(f"无法从 LLM 输出解析 JSON: {text[:200]}")
+    """从模型输出中稳健地提取 JSON 对象。
+
+    模型输出常见三种形态，都要能解析出来：
+    1. 干净的 JSON；
+    2. JSON 后面多了一段说明文字（或**再来一个 JSON 对象**）；
+    3. 包在 ```json 代码块里。
+
+    直接用 `json.loads` 在第 2 种情况下会抛
+    `Extra data: line 3 column 1 (char ...)`（简历 115 就是这么失败的）；
+    贪婪正则 `\\{.*\\}` 会把两段一起匹配，同样失败。
+    这里用 `raw_decode`：从每个 `{` 起只解析**一个**完整对象，多余内容直接忽略。
+    """
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("LLM 输出为空，无法解析 JSON")
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(text):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(text[i:])
+        except json.JSONDecodeError:
+            continue          # 这个 `{` 不是对象起点（如模板里的花括号），继续往后找
+        if isinstance(obj, dict):
+            return obj
+    raise ValueError(f"无法从 LLM 输出解析 JSON: {text[:200]}")
 
 
 # ---------- 业务封装 ----------

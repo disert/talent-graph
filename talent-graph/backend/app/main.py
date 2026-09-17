@@ -52,6 +52,23 @@ def startup() -> None:
     _seed_default_departments()
     _backfill_department_provinces()
     _recover_stuck_parsing()
+    _log_embedding_backend()
+
+
+def _log_embedding_backend() -> None:
+    """启动时交代向量通道走哪条路：出问题时不必翻代码猜是本地模型还是平台接口。
+
+    本地模型首次使用还有个坑：sentence-transformers 会先联网校验 huggingface.co 上的文件，
+    内网/国内直连不通时会长时间挂着（详见 embedding.py 顶部说明）。
+    """
+    from .config import settings
+
+    if settings.embedding_base_url:
+        logger.info("Embedding 通道：平台接口 %s（model=%s）",
+                    settings.embedding_base_url, settings.embedding_model)
+    else:
+        logger.info("Embedding 通道：本地模型 %s（EMBEDDING_BASE_URL 为空）",
+                    settings.embedding_local_path)
 
 
 def _seed_default_departments() -> None:
@@ -99,4 +116,7 @@ def _recover_stuck_parsing() -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok"}
+    """健康检查：顺带返回后台解析/匹配队列的积压情况，便于排查"上传后一直不出结果"。"""
+    from .concurrency import heavy_queue_status
+
+    return {"status": "ok", "heavy_tasks": heavy_queue_status()}

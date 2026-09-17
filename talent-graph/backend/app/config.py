@@ -9,6 +9,18 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/talent_graph"
     # docker-compose 内部访问：postgresql+psycopg2://postgres:postgres@db:5432/talent_graph
 
+    # 连接池：SQLAlchemy 默认只有 5 + 10 溢出。批量上传简历时，每个后台解析任务
+    # 在匹配阶段都要占用连接，默认值会被瞬间打爆并抛
+    # `QueuePool limit of size 5 overflow 10 reached`，这里放宽并让取不到连接时快速失败。
+    db_pool_size: int = 20            # 常驻连接数
+    db_max_overflow: int = 30         # 峰值可临时超出数（合计 50）
+    db_pool_timeout: float = 5.0      # 取连接的等待秒数（默认 30s 会让请求全挂死）
+    db_pool_recycle: int = 1800       # 连接最长复用秒数，避免中间件断开空闲连接
+
+    # 重负载后台任务（OCR / LLM / embedding）并发上限。上传简历按文件起后台任务，
+    # 不限并发会同时抢 CPU、抢连接、触发上游限流。单实例内部工具，进程内队列够用。
+    heavy_task_concurrency: int = 1
+
     # 内部大模型平台（内网 API，默认按 OpenAI 兼容协议对接）
     llm_base_url: str = "http://internal-llm-platform.local/v1"
     llm_api_key: str = "internal-key"
@@ -21,7 +33,12 @@ class Settings(BaseSettings):
     embedding_api_key: str = ""
     embedding_model: str = "bge-m3"
     embedding_dim: int = 1024         # BGE-M3 向量维度
-    embedding_local_path: str = "BAAI/bge-m3"  # 本地模型路径或 HuggingFace 名称
+    embedding_local_path: str = "BAAI/bge-m3"  # 本地模型目录（推荐）或 HuggingFace 仓库名
+
+    # 本地 Embedding 模型下载相关（仅当模型不在本地缓存、确实需要联网下载时生效）
+    # 内网/国内直连 huggingface.co 会被黑洞丢包，必须走镜像，否则会一直挂着
+    hf_endpoint: str = "https://hf-mirror.com"  # 置空则用官方源；显式设 HF_ENDPOINT 环境变量优先生效
+    hf_timeout: float = 20.0          # HF 元数据/下载单次超时秒数（不给无限等待的机会）
 
     # 文件存储（一期存本地磁盘，二期可换 MinIO）
     upload_dir: str = "./data/uploads"
