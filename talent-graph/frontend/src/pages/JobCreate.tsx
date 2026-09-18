@@ -4,9 +4,9 @@ import {
   Statistic, Tag, Typography, message,
 } from "antd";
 import type { ChangeEvent } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { jobApi, type DepartmentNode } from "../api/client";
+import { jobApi, uploadErrorMessage, type DepartmentNode } from "../api/client";
 import DepartmentAdminCard from "../components/DepartmentAdminCard";
 import { useJobImport } from "../stores/jobImport";
 import { provinceOfPath } from "./jobShared";
@@ -41,15 +41,19 @@ export default function JobCreatePage() {
     [deptTree, selectedDept],
   );
 
-  const loadDeptTree = () =>
-    jobApi
-      .departments()
-      .then((r) => setDeptTree(r.data))
-      .catch((e) => message.error(e?.response?.data?.detail || "部门级联数据加载失败"));
+  // useCallback：作为 DepartmentAdminCard 的 onChanged 传入，引用稳定才能让它的树渲染保持稳定
+  const loadDeptTree = useCallback(
+    () =>
+      jobApi
+        .departments()
+        .then((r) => setDeptTree(r.data))
+        .catch((e) => message.error(e?.response?.data?.detail || "部门级联数据加载失败")),
+    [],
+  );
 
   useEffect(() => {
     loadDeptTree();
-  }, []);
+  }, [loadDeptTree]);
 
   const onFinish = async (values: FormValues) => {
     setSubmitting(true);
@@ -108,7 +112,7 @@ export default function JobCreatePage() {
       const r = await jobApi.importPrepare(file); // 只解析不入库：先拿到总行数与预检异常
       useJobImport.getState().start(r.data);
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || "导入失败，请检查文件格式");
+      message.error(uploadErrorMessage(err, "导入失败，请检查文件格式"));
     } finally {
       setImporting(false);
     }

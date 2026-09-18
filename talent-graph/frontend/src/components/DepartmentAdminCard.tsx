@@ -5,10 +5,11 @@ import {
   Alert, Button, Card, List, Modal, Popconfirm, Select, Space, Statistic, Tag, Tree,
   Typography, message,
 } from "antd";
-import type { ChangeEvent, ReactNode } from "react";
-import { useMemo, useRef, useState } from "react";
+import type { TreeDataNode } from "antd";
+import type { ChangeEvent } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import {
-  departmentApi, type DepartmentImportResult, type DepartmentNode,
+  departmentApi, uploadErrorMessage, type DepartmentImportResult, type DepartmentNode,
 } from "../api/client";
 
 /** 省份候选（部门省份维护用） */
@@ -65,11 +66,13 @@ export default function DepartmentAdminCard({ tree, onChanged }: {
   const [provinceInput, setProvinceInput] = useState<string | undefined>(undefined);
   const [savingProvince, setSavingProvince] = useState(false);
 
-  const openProvinceEditor = (n: AdminTreeNode) => {
+  // 下面三个回调必须保持引用稳定：它们被 titleRender 依赖，若每次渲染都新建，
+  // 展开/折叠时整棵树的标题元素都会重建（组织架构有近 600 个节点，肉眼可见地卡一下）。
+  const openProvinceEditor = useCallback((n: AdminTreeNode) => {
     if (n.rawId == null) return;
     setEditing({ id: n.rawId, name: n.title, province: n.province });
     setProvinceInput(n.province || undefined);
-  };
+  }, []);
 
   const saveProvince = async () => {
     if (!editing) return;
@@ -108,7 +111,7 @@ export default function DepartmentAdminCard({ tree, onChanged }: {
         message.warning(`导入完成：成功 ${r.data.succeeded} 个，失败 ${r.data.failed} 个，详见明细`);
       }
     } catch (err: any) {
-      message.error(err?.response?.data?.detail || "导入失败，请检查文件格式");
+      message.error(uploadErrorMessage(err, "导入失败，请检查文件格式"));
     } finally {
       setImporting(false);
     }
@@ -129,7 +132,7 @@ export default function DepartmentAdminCard({ tree, onChanged }: {
     });
   };
 
-  const deleteNode = async (node: AdminTreeNode) => {
+  const deleteNode = useCallback(async (node: AdminTreeNode) => {
     if (node.rawId == null) return;
     try {
       await departmentApi.remove(node.rawId);
@@ -138,7 +141,40 @@ export default function DepartmentAdminCard({ tree, onChanged }: {
     } catch (e: any) {
       message.error(e?.response?.data?.detail || "删除失败");
     }
-  };
+  }, [onChanged]);
+
+  /** 节点标题：useCallback 保持引用稳定，配合 Tree 虚拟滚动只渲染可见节点 */
+  const renderTitle = useCallback((node: TreeDataNode) => {
+    const n = node as unknown as AdminTreeNode;
+    return (
+      <Space size="small">
+        <span>{n.title}</span>
+        <Tag
+          color={n.effectProvince ? "blue" : "default"}
+          style={{ cursor: n.rawId != null ? "pointer" : "default", marginInlineEnd: 0 }}
+          onClick={() => openProvinceEditor(n)}
+          title="点击设置 / 修改该部门所在省份（留空=继承上级）"
+        >
+          {n.effectProvince
+            ? `${n.effectProvince}${n.province ? "" : "·继承"}`
+            : "未设省份"}
+        </Tag>
+        {n.isLeaf && n.rawId != null && (
+          <Popconfirm
+            title="删除该部门节点？"
+            okText="删除"
+            okButtonProps={{ danger: true }}
+            cancelText="取消"
+            onConfirm={() => deleteNode(n)}
+          >
+            <Typography.Text type="danger" style={{ fontSize: 12 }}>
+              删除
+            </Typography.Text>
+          </Popconfirm>
+        )}
+      </Space>
+    );
+  }, [openProvinceEditor, deleteNode]);
 
   return (
     <Card
@@ -168,45 +204,18 @@ export default function DepartmentAdminCard({ tree, onChanged }: {
           </Button>
         </Space>
         <input ref={fileRef} type="file" accept=".xlsx,.xlsm" style={{ display: "none" }} onChange={onPickImportFile} />
-        <div style={{ maxHeight: 320, overflow: "auto", border: "1px solid #f0f0f0", borderRadius: 6, padding: 8 }}>
+        {/* 外框只负责描边：滚动交给 Tree 自己。Tree 必须传 height 才会启用虚拟滚动，
+            否则近 600 个节点会全部渲染成 DOM，展开/折叠时都会卡一下。 */}
+        <div style={{ border: "1px solid #f0f0f0", borderRadius: 6, padding: 8 }}>
           {treeData.length === 0 ? (
             <Typography.Text type="secondary">暂无部门数据，请导入 Excel 或点击「恢复默认示例」。</Typography.Text>
           ) : (
             <Tree
               showLine
               defaultExpandAll
+              height={320}
               treeData={treeData}
-              titleRender={(node) => {
-                const n = node as unknown as AdminTreeNode;
-                return (
-                  <Space size="small">
-                    <span>{n.title as ReactNode}</span>
-                    <Tag
-                      color={n.effectProvince ? "blue" : "default"}
-                      style={{ cursor: n.rawId != null ? "pointer" : "default", marginInlineEnd: 0 }}
-                      onClick={() => openProvinceEditor(n)}
-                      title="点击设置 / 修改该部门所在省份（留空=继承上级）"
-                    >
-                      {n.effectProvince
-                        ? `${n.effectProvince}${n.province ? "" : "·继承"}`
-                        : "未设省份"}
-                    </Tag>
-                    {n.isLeaf && n.rawId != null && (
-                      <Popconfirm
-                        title="删除该部门节点？"
-                        okText="删除"
-                        okButtonProps={{ danger: true }}
-                        cancelText="取消"
-                        onConfirm={() => deleteNode(n)}
-                      >
-                        <Typography.Text type="danger" style={{ fontSize: 12 }}>
-                          删除
-                        </Typography.Text>
-                      </Popconfirm>
-                    )}
-                  </Space>
-                );
-              }}
+              titleRender={renderTitle}
             />
           )}
         </div>

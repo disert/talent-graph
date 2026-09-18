@@ -136,7 +136,8 @@ docker compose build backend --build-arg PIP_INDEX=https://pypi.org/simple   # �
   docker compose build frontend       # args 已写在 docker-compose.yml（VITE_BASE_PATH / VITE_API_BASE）
   ```
   代理机 nginx 用 `location /talent-graph/frontend { proxy_pass http://<应用机>:20022; }`（**结尾不加斜杠**），
-  后端 location 记得加 `client_max_body_size 100m;`。完整步骤与验收见 `部署说明.md` 附录 B。
+  并在 server 块加 `client_max_body_size 100m;`（默认 1m，不加则上传附件一律 413；前端容器自带的 nginx
+  也已同步放开）。完整步骤与验收见 `部署说明.md` 附录 B。
 
 ## 使用流程（对应演示主线）
 

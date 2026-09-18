@@ -2,7 +2,7 @@ import { InboxOutlined } from "@ant-design/icons";
 import { Alert, Button, Card, Popconfirm, Select, Space, Table, Tag, Upload, message } from "antd";
 import type { UploadFile } from "antd";
 import { useEffect, useState } from "react";
-import { STATUS_MAP, displayName, resumeApi, type Resume } from "../api/client";
+import { STATUS_MAP, displayName, resumeApi, uploadErrorMessage, type Resume } from "../api/client";
 
 const SOURCE_OPTIONS = ["猎头直推", "进校园", "邮箱", "交流会"].map((v) => ({ value: v, label: v }));
 
@@ -43,7 +43,7 @@ export default function ResumeUploadPage() {
         okCount += 1;
         setFileList((prev) => prev.filter((p) => p.uid !== uf.uid));
       } catch (e: any) {
-        failed.push(`${uf.name}：${e?.response?.data?.detail || "上传失败"}`);
+        failed.push(`${uf.name}：${uploadErrorMessage(e)}`);
       }
     }
     setUploading(false);

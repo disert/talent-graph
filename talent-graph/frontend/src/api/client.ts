@@ -13,6 +13,20 @@ export const API_BASE = (import.meta.env.VITE_API_BASE || "/api").replace(/\/+$/
 
 export const api = axios.create({ baseURL: API_BASE, timeout: 300000 });
 
+/**
+ * 上传类请求的报错文案。
+ *
+ * 被 nginx / 反向代理拦下的 413 返回的是 HTML 错误页（没有 `detail` 字段），
+ * 直接取 `e.response.data.detail` 只会得到一句「上传失败」，从提示上看不出
+ * 「文件太大被网关挡了」。这里统一转成可操作的中文提示。
+ */
+export const uploadErrorMessage = (e: any, fallback = "上传失败"): string => {
+  if (e?.response?.status === 413) {
+    return "文件超过服务器允许的上传大小（HTTP 413），请让运维放开反向代理/网关的 client_max_body_size";
+  }
+  return e?.response?.data?.detail || e?.message || fallback;
+};
+
 // ---------- 类型 ----------
 export interface Resume {
   id: number;

@@ -176,9 +176,16 @@ def upload_resumes(
             suffix = Path(f.filename or "").suffix.lower()
             save_path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
             with file_timer.stage("接收落盘"):
-                data = f.file.read()
-                save_path.write_bytes(data)
-            file_timer.note(f"{len(data) / 1024 / 1024:.2f}MB")
+                # 分块落盘：附件上限放到 100MB 后，不再把整份文件读进内存再写盘
+                size = 0
+                with save_path.open("wb") as dst:
+                    while True:
+                        chunk = f.file.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        dst.write(chunk)
+            file_timer.note(f"{size / 1024 / 1024:.2f}MB")
 
             with file_timer.stage("入库"):
                 resume = Resume(
