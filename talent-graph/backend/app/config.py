@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     # 内网既连不上、也常被黑洞丢包，这种请求会一直挂着把整条解析队列拖死。
     offline_mode: bool = False
 
+    # 上游报文日志（内网联调排查用，见 app/upstream_log.py）：
+    # 开启后把 LLM / Embedding 的**真实请求 URL + 请求体预览 + 响应状态码/耗时/响应体预览**
+    # 打到 INFO（超长自动截断、api key 自动脱敏、失败与 4xx/5xx 必打）。
+    # 逐条精排一次匹配会调用成百上千次 LLM，日志量较大；排查完可改 false。
+    debug_upstream: bool = False
+    upstream_log_max_chars: int = 800   # 单段报文预览最大字符数（0 = 不截断，慎用）
+
     # 文件存储（一期存本地磁盘，二期可换 MinIO）
     upload_dir: str = "./data/uploads"
 

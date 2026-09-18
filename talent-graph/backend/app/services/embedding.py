@@ -17,6 +17,8 @@ import time
 from pathlib import Path
 
 from ..config import settings
+from ..upstream_log import (check_base_url, describe_exception, describe_secret,
+                            json_preview, network_hint, new_http_client)
 
 logger = logging.getLogger(__name__)
 
@@ -91,15 +93,66 @@ def _prepare_hf_env(path: str) -> bool:
 def _embed_via_platform(texts: list[str]) -> list[list[float]]:
     from openai import OpenAI
 
+    check_base_url("Embedding", settings.embedding_base_url, "/embeddings")
+    # http_client 挂日志钩子：打印真实请求 URL（能暴露 base_url 重复拼接）、请求体预览、
+    # 响应状态码与耗时；失败时能看到对端到底说了什么，而不是 SDK 那句 Connection error。
     client = OpenAI(base_url=settings.embedding_base_url, api_key=settings.embedding_api_key,
-                    timeout=settings.llm_timeout)
+                    timeout=settings.llm_timeout,
+                    http_client=new_http_client("Embedding", settings.llm_timeout))
+    logger.info("[Embedding 请求] base_url=%s | model=%s | key=%s | %d 条 / %d 字符 | 预览：%s",
+                settings.embedding_base_url, settings.embedding_model,
+                describe_secret(settings.embedding_api_key), len(texts),
+                sum(len(t or "") for t in texts), json_preview(texts[:2], 300))
     # 显式声明 encoding_format=float：SiliconFlow 等平台的 bge-m3 不传该参数会报 20015
     start = time.perf_counter()
-    resp = client.embeddings.create(model=settings.embedding_model, input=texts,
-                                    encoding_format="float")
-    logger.info("平台 Embedding 完成：%d 条，耗时 %.2fs", len(texts),
-                time.perf_counter() - start)
-    return [item.embedding for item in resp.data]
+    try:
+        resp = client.embeddings.create(model=settings.embedding_model, input=texts,
+                                        encoding_format="float")
+    except Exception as e:
+        # 平台侧 4xx/5xx、连不上、超时都汇到这里，异常链 + 中文排查方向一次给全
+        logger.error("[Embedding 失败] model=%s | %d 条输入 | 耗时 %.2fs：%s",
+                     settings.embedding_model, len(texts),
+                     time.perf_counter() - start, describe_exception(e))
+        hint = network_hint(e)
+        if hint:
+            logger.error("[Embedding 排查方向] %s（BASE_URL=%s）", hint, settings.embedding_base_url)
+        raise
+    seconds = time.perf_counter() - start
+    vectors = [list(item.embedding) for item in resp.data]
+    _log_platform_result(vectors, len(texts), seconds, resp)
+    return vectors
+
+
+def _log_platform_result(vectors: list[list[float]], input_count: int,
+                         seconds: float, resp: object) -> None:
+    """记录平台返回结果，并做两项内网最容易踩的自检。
+
+    1. **维度自检**：pgvector 列是 `Vector(EMBEDDING_DIM)`（默认 1024）。若平台实际返回别的维度
+       （如 Qwen3-Embedding-4B 原生 2560 维），写库时会报维度不匹配；这里提前把「返回了多少维」
+       明确打出来，不用等 DB 报错才知道是模型/配置不对。
+    2. **零向量自检**：部分网关在参数错误时也返回 200，但向量全是 0，会让相似度恒为 0（匹配结果
+       看起来“什么都没匹配上”）。
+    """
+    dims = {len(v) for v in vectors}
+    usage = getattr(resp, "usage", None)
+    logger.info("[Embedding 响应] %d 条（请求 %d 条）| 维度=%s（期望 %d）| 耗时 %.2fs | usage=%s",
+                len(vectors), input_count, sorted(dims) or "无", settings.embedding_dim, seconds,
+                json_preview(usage.model_dump() if hasattr(usage, "model_dump") else usage, 200))
+    if not vectors:
+        logger.warning("[Embedding 异常] 平台返回了 0 条向量（请求了 %d 条）", input_count)
+        return
+    if dims != {settings.embedding_dim}:
+        logger.error("[Embedding 维度不匹配] 平台返回 %s 维，而 EMBEDDING_DIM=%d、"
+                     "数据库中向量列宽度也按 %d 建。请二选一：① 把 EMBEDDING_DIM 改成实际维度并重建向量列；"
+                     "② 换一个输出 %d 维的模型。继续写入会报 “expected %d dimensions” 错误。",
+                     sorted(dims), settings.embedding_dim, settings.embedding_dim,
+                     settings.embedding_dim, settings.embedding_dim)
+    first = vectors[0]
+    if first and all(abs(float(x)) < 1e-12 for x in first):
+        logger.warning("[Embedding 异常] 首条向量全为 0：平台可能没真正处理入参（网关兼容返回）。"
+                       "可开 DEBUG_UPSTREAM=true 看原始响应体。")
+    if settings.debug_upstream:
+        logger.info("[Embedding 向量预览] 首条前 8 维=%s", json_preview(first[:8]))
 
 
 def _load_local_model():
@@ -135,17 +188,32 @@ def _load_local_model():
 
 def _embed_local(texts: list[str]) -> list[list[float]]:
     model = _load_local_model()
+    logger.info("[Embedding 请求] 本地模型 %s | %d 条 / %d 字符 | 预览：%s",
+                settings.embedding_local_path, len(texts),
+                sum(len(t or "") for t in texts), json_preview(texts[:2], 300))
     start = time.perf_counter()
     vecs = model.encode(texts, normalize_embeddings=True)
-    logger.info("本地 Embedding 推理完成：%d 条，耗时 %.2fs", len(texts),
+    vectors = [v.tolist() for v in vecs]
+    logger.info("本地 Embedding 推理完成：%d 条，维度 %s，耗时 %.2fs",
+                len(vectors), len(vectors[0]) if vectors else 0,
                 time.perf_counter() - start)
-    return [v.tolist() for v in vecs]
+    return vectors
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
+    """把一批文本向量化。空入参直接返回，避免向平台发無意義请求。"""
+    if not texts:
+        return []
+    # 入参容错：列表里混进 None/数字时直接发给平台会被 400 拒掉，而失败会拖垮整条解析流水线
+    cleaned: list[str] = []
+    for t in texts:
+        cleaned.append(t if isinstance(t, str) else ("" if t is None else str(t)))
+    if cleaned != texts:
+        logger.warning("Embedding 入参存在非字符串项，已强制转成文本（原类型：%s）",
+                       sorted({type(t).__name__ for t in texts}))
     if settings.embedding_base_url:
-        return _embed_via_platform(texts)
-    return _embed_local(texts)
+        return _embed_via_platform(cleaned)
+    return _embed_local(cleaned)
 
 
 def embed_one(text: str) -> list[float]:

@@ -16,6 +16,8 @@ from typing import Any
 from openai import OpenAI
 
 from ..config import settings
+from ..upstream_log import (check_base_url, describe_exception, describe_secret, ellipsis,
+                            network_hint, new_http_client)
 
 logger = logging.getLogger(__name__)
 
@@ -25,8 +27,15 @@ _client: OpenAI | None = None
 def get_client() -> OpenAI:
     global _client
     if _client is None:
+        check_base_url("LLM", settings.llm_base_url, "/chat/completions")
+        logger.info("初始化 LLM 客户端：base_url=%s | model=%s | key=%s | timeout=%ss",
+                    settings.llm_base_url, settings.llm_model,
+                    describe_secret(settings.llm_api_key), settings.llm_timeout)
+        # http_client 挂日志钩子：记录真实请求 URL + 请求体预览 + 响应状态/正文预览
+        # （OpenAI SDK 默认一句报文都不打，内网排查时完全看不到发到哪、回了什么）
         _client = OpenAI(base_url=settings.llm_base_url, api_key=settings.llm_api_key,
-                         timeout=settings.llm_timeout, max_retries=0)  # 重试自行控制
+                         timeout=settings.llm_timeout, max_retries=0,  # 重试自行控制
+                         http_client=new_http_client("LLM", settings.llm_timeout))
     return _client
 
 
@@ -37,41 +46,74 @@ def _chat(messages: list[dict[str, str]], json_mode: bool = True) -> str:
         kwargs["response_format"] = {"type": "json_object"}
 
     last_err: Exception | None = None
-    for attempt in range(settings.llm_max_retries):
+    max_attempts = max(1, settings.llm_max_retries)
+    for attempt in range(max_attempts):
         start = time.perf_counter()
         try:
             resp = get_client().chat.completions.create(
                 model=settings.llm_model, messages=messages, temperature=0.1, **kwargs
             )
-            _log_call_seconds(time.perf_counter() - start, attempt)
+            _log_call(time.perf_counter() - start, attempt, messages, resp)
             return resp.choices[0].message.content or ""
         except Exception as e:  # 平台不支持 json 模式时降级
             if json_mode and "response_format" in str(e):
+                logger.info("平台不支持 response_format=json_object，降级为普通调用重试")
                 return _chat_no_json(messages)
             last_err = e
-            wait = 2 ** attempt
-            logger.warning("LLM 调用失败（第 %d 次，已耗时 %.2fs），%ds 后重试: %s",
-                           attempt + 1, time.perf_counter() - start, wait, e)
-            time.sleep(wait)
-    raise RuntimeError(f"LLM 调用连续失败 {settings.llm_max_retries} 次: {last_err}")
+            already = time.perf_counter() - start
+            # 完整异常链 + HTTP 状态码 + 对端响应体片段，内网失败时这一行最关键
+            logger.warning("LLM 调用失败（第 %d/%d 次，本次耗时 %.2fs）：%s",
+                           attempt + 1, max_attempts, already, describe_exception(e))
+            hint = network_hint(e)
+            if hint:
+                logger.warning("LLM 失败排查方向：%s（当前 BASE_URL=%s，如需看真实请求 URL 请开 DEBUG_UPSTREAM=true）",
+                               hint, settings.llm_base_url)
+            if attempt + 1 < max_attempts:
+                wait = 2 ** attempt
+                logger.warning("%ds 后重试（共 %d 次）", wait, max_attempts)
+                time.sleep(wait)
+    raise RuntimeError(f"LLM 调用连续失败 {max_attempts} 次: {last_err}")
 
 
 # 单次大模型调用超过该秒数就记一条 INFO（逐条精排会有成百上千次调用，全部打日志太吵）
 _LLM_SLOW_SECONDS = 5.0
 
 
-def _log_call_seconds(seconds: float, attempt: int) -> None:
-    """单次 LLM 调用耗时：常规走 DEBUG，偏慢才升到 INFO，便于定位"哪次调用卡住了"。"""
-    if seconds >= _LLM_SLOW_SECONDS:
-        logger.info("LLM 单次调用耗时 %.2fs（第 %d 次尝试）", seconds, attempt + 1)
+def _log_call(seconds: float, attempt: int, messages: list[dict[str, str]], resp: Any) -> None:
+    """单次 LLM 调用汇总：耗时 / 入参规模 / 输出规模 / finish_reason / token 用量。
+
+    常规走 DEBUG（逐条精排上千次调用，全打 INFO 会刷屏），偏慢或开了 DEBUG_UPSTREAM 才升 INFO。
+    逐字输出不在这里打 —— 原始报文由 httpx 钩子打印，避免同一份内容重复两遍。
+    """
+    choice = resp.choices[0] if getattr(resp, "choices", None) else None
+    content = (getattr(getattr(choice, "message", None), "content", "") or "")
+    usage = getattr(resp, "usage", None)
+    usage_text = ""
+    if usage is not None:
+        usage_text = (f" | tokens(prompt={getattr(usage, 'prompt_tokens', None)}"
+                      f", completion={getattr(usage, 'completion_tokens', None)}"
+                      f", total={getattr(usage, 'total_tokens', None)})")
+    line = (f"[LLM 调用] model={settings.llm_model} 第{attempt + 1}次 | "
+            f"入 {len(messages)} 条 / {sum(len(m.get('content') or '') for m in messages)} 字符 | "
+            f"出 {len(content)} 字符 | finish={getattr(choice, 'finish_reason', None)} | "
+            f"耗时 {seconds:.2f}s{usage_text}")
+    if settings.debug_upstream or seconds >= _LLM_SLOW_SECONDS:
+        logger.info(line)
     else:
-        logger.debug("LLM 单次调用耗时 %.2fs（第 %d 次尝试）", seconds, attempt + 1)
+        logger.debug(line)
+    # 输出为空是最隐蔽的失败（模型没按格式回、被网关截断），单独提示
+    if not content.strip():
+        logger.warning("[LLM 输出为空] model=%s 第%d次调用返回空内容，finish_reason=%s "
+                       "（可能是触发内容过滤/网关拦截/超时截断，可开 DEBUG_UPSTREAM=true 看原始响应）",
+                       settings.llm_model, attempt + 1, getattr(choice, "finish_reason", None))
 
 
 def _chat_no_json(messages: list[dict[str, str]]) -> str:
+    start = time.perf_counter()
     resp = get_client().chat.completions.create(
         model=settings.llm_model, messages=messages, temperature=0.1
     )
+    _log_call(time.perf_counter() - start, 0, messages, resp)
     return resp.choices[0].message.content or ""
 
 
@@ -101,6 +143,8 @@ def _extract_json(text: str) -> dict[str, Any]:
             continue          # 这个 `{` 不是对象起点（如模板里的花括号），继续往后找
         if isinstance(obj, dict):
             return obj
+    # 解析失败会把整份简历/岗位的解析一起拖失败，原始输出必须留证（截断，避免刷屏）
+    logger.error("[LLM 输出解析失败] 原始输出（截断）：%s", ellipsis(text))
     raise ValueError(f"无法从 LLM 输出解析 JSON: {text[:200]}")
 
 

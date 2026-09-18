@@ -1,4 +1,9 @@
-"""简历文件文本提取：PDF/Word 直取文本，图片与扫描件走 PaddleOCR。"""
+"""简历文件文本提取：PDF/Word 直取文本，图片与扫描件走 PaddleOCR。
+
+日志约定（排查内网问题用，详见 app/upstream_log.py）：
+- 关键节点（模型缓存目录、引擎初始化、逐页识别进度、异常链）一律打 INFO/WARNING；
+- 被识别的**文本内容**属于敏感数据，只在 DEBUG_UPSTREAM=true 时打前 15 行预览。
+"""
 from __future__ import annotations
 
 import logging
@@ -8,6 +13,9 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from ..config import settings
+from ..upstream_log import describe_exception, ellipsis
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +114,10 @@ def _prepare_ocr_offline_env() -> None:
 
     cache_home = os.environ.get("PADDLE_PDX_CACHE_HOME") or str(Path.home() / ".paddlex")
     models_dir = Path(cache_home) / "official_models"
+    # 先把环境变量本身打出来：内网卡在「模型初始化」时，第一件事就是确认这里有没有去联网
+    logger.info("[OCR] 离线配置：MODEL_SOURCE=%s | 跳过联网探测=%s | 模型缓存目录=%s",
+                os.environ.get("PADDLE_PDX_MODEL_SOURCE"),
+                os.environ.get("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"), models_dir)
     missing = [m for m in ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec",
                            "PP-LCNet_x1_0_textline_ori")
                if not (models_dir / m).is_dir()]
@@ -135,6 +147,8 @@ def _build_ocr_engine():
     """
     from paddleocr import PaddleOCR
 
+    logger.info("[OCR] 初始化 PaddleOCR：lang=ch | 文本行方向=开 | 文档方向分类=关 | "
+                "文档矫正=关 | mkldnn=关（首次较慢，要载入 3 个模型）")
     try:
         # PaddleOCR 3.x：文本行方向参数名为 use_textline_orientation
         return PaddleOCR(lang="ch", use_textline_orientation=True,
@@ -194,10 +208,20 @@ def _extract_pdf_ocr(path: Path) -> str:
     t0 = time.perf_counter()
     texts: list[str] = []
     with fitz.open(path) as doc:
-        for page in doc:
+        total = doc.page_count
+        # 扫描件 OCR 单页可能要几十秒~几分钟，必须逐页打点，
+        # 否则日志上看起来就是「上传后一直没动静」，无法判断是卡住还是在算。
+        logger.info("[OCR] 扫描件开始识别：%s，共 %d 页（首次会加载模型，可能较慢）",
+                    path.name, total)
+        for index, page in enumerate(doc, 1):
+            page_start = time.perf_counter()
             pix = page.get_pixmap(dpi=200)
             img_bytes = pix.tobytes("png")
-            texts.append(_ocr_image_bytes(img_bytes))
+            page_text = _ocr_image_bytes(img_bytes)
+            texts.append(page_text)
+            logger.info("[OCR] 第 %d/%d 页完成：%d 字，本页 %.2fs（累计 %.2fs）",
+                        index, total, len(page_text.strip()),
+                        time.perf_counter() - page_start, time.perf_counter() - t0)
     text = "\n".join(texts)
     logger.info("扫描件 OCR 完成：%s，%d 页 / %d 字，耗时 %.2fs",
                 path.name, len(texts), len(text), time.perf_counter() - t0)
@@ -231,6 +255,7 @@ def _ocr_image_bytes(img_bytes: bytes) -> str:
             if _ocr_engine is None:
                 if _ocr_init_error:      # 等锁期间别的线程已确认初始化失败
                     raise ValueError(f"OCR 引擎不可用（初始化时失败）：{_ocr_init_error}")
+                logger.info("[OCR] 引擎尚未初始化，获取到初始化锁，开始加载模型")
                 _prepare_paddlex_home()        # 必须早于 import paddleocr
                 _prepare_ocr_offline_env()     # 同上：联网相关开关都必须在导入前设好
                 try:
@@ -245,7 +270,8 @@ def _ocr_image_bytes(img_bytes: bytes) -> str:
                         "请在 backend 环境执行：pip install paddlepaddle paddleocr 后重新解析。"
                     ) from e
                 except Exception as e:
-                    logger.exception("OCR 引擎初始化失败")
+                    # 完整异常链：区分「模块没装」「模型文件缺失」「路径含中文」「C++ 层报错」
+                    logger.exception("[OCR] 引擎初始化失败：%s", describe_exception(e))
                     _ocr_init_error = str(e)
                     raise ValueError(
                         f"OCR 引擎初始化失败：{e}。"
@@ -256,6 +282,8 @@ def _ocr_image_bytes(img_bytes: bytes) -> str:
     import io
 
     img = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
+    logger.info("[OCR] 单页识别开始：图像 %dx%d、输入 %d KB",
+                img.shape[1], img.shape[0], len(img_bytes) // 1024)
     lock_start = time.perf_counter()
     try:
         # 识别阶段同样加锁：PaddleOCR 的 C++ 推理不保证线程安全，
@@ -266,12 +294,19 @@ def _ocr_image_bytes(img_bytes: bytes) -> str:
             result = _run_ocr(_ocr_engine, img)
             recog_seconds = time.perf_counter() - recog_start
     except Exception as e:
-        logger.exception("OCR 文字识别失败")
+        logger.exception("[OCR] 文字识别失败（等锁 %.2fs 后抛错）：%s",
+                         time.perf_counter() - lock_start, describe_exception(e))
         raise ValueError(f"OCR 文字识别失败：{e}") from e
     lines = _collect_ocr_text(result)
     # 「等锁」= 被其他并发解析任务挡住的时间，与真正的识别耗时分开看才能判断该调并发还是调 CPU
-    logger.info("OCR 识别完成：等锁 %.2fs + 识别 %.2fs，输出 %d 行文本",
-                lock_wait, recog_seconds, len(lines))
+    logger.info("OCR 识别完成：等锁 %.2fs + 识别 %.2fs，输出 %d 行 / %d 字",
+                lock_wait, recog_seconds, len(lines), sum(len(x) for x in lines))
+    if not lines:
+        # 最常见两种：扫描页确实是空白，或模型没真正加载（参数/缓存问题）
+        logger.warning("[OCR] 本页未识别到任何文字：可能是空白页/分辨率过低，"
+                       "或 OCR 模型未正确加载（看上面的模型缓存目录日志）")
+    elif settings.debug_upstream:
+        logger.info("[OCR 文本预览] %s", ellipsis(" / ".join(lines[:15])))
     return "\n".join(lines)
 
 
